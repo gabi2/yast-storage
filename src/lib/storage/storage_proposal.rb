@@ -48,21 +48,23 @@ module Yast
       attr_accessor :settings
 
       # devicegraph names
-      PROPOSAL = "proposal"
-      PROBED   = "probed"
+      PROPOSAL_BASE = "proposal_base"
+      PROPOSAL      = "proposal"
+      PROBED        = "probed"
+      STAGING       = "staging"
 
       def initialize
         @settings = ProposalSettings.new
         @proposal = nil # ::Storage::DeviceGraph
         @disk_blacklist = []
         @disk_greylist  = []
+        @actions = nil
       end
 
       # Create a storage proposal.
       def propose
-        storage = StorageManager.instance # this will start probing in the first invocation
-        storage.remove_devicegraph(PROPOSAL) if storage.exist_devicegraph(PROPOSAL)
-        @proposal = storage.copy_devicegraph(PROBED, PROPOSAL)
+        StorageManager.start_probing
+        prepare_devicegraphs
 
         boot_requirements_checker = BootRequirementsChecker.new(@settings)
         @volumes = boot_requirements_checker.needed_partitions
@@ -71,16 +73,72 @@ module Yast
         disk_analyzer = DiskAnalyzer.new
         disk_analyzer.analyze
 
-        space_maker = SpaceMaker.new(@volumes, @settings, disk_analyzer)
+        space_maker = SpaceMaker.new(settings: @settings,
+                                     volumes:  @volumes,
+                                     candidate_disks:    disk_analyzer.candidate_disks,
+                                     linux_partitions:   disk_analyzer.linux_partitions,
+                                     windows_partitions: disk_analyzer.windows_partitions,
+                                     devicegraph: @proposal)
         space_maker.find_space
+        space_maker.delete_all_partitions("/dev/sda")
+        proposal_to_staging
+        action_text = proposal_text
+        log.info("Actions:\n#{action_text}\n")
+        print("\nActions:\n\n#{action_text}\n")
       end
 
+      # Return the textual description of the actions necessary to transform
+      # the probed devicegraph into the staging devicegraph.
+      #
       def proposal_text
-        # TO DO
-        "No disks found - no storage proposal possible"
+        return "No storage proposal possible" unless @actions
+        @actions.commit_actions_as_strings.to_a.join("\n")
+      end
+
+      # Reset the proposal devicegraph (PROPOSAL) to PROPOSAL_BASE.
+      #
+      def reset_proposal
+        log.debug("Resetting proposal devicegraph")
+        storage = StorageManager.instance
+        storage.remove_devicegraph(PROPOSAL) if storage.exist_devicegraph(PROPOSAL)
+        @proposal = storage.copy_devicegraph(PROPOSAL_BASE, PROPOSAL)
+        @actions  = nil
+      end
+
+      # Copy the PROPOSAL devicegraph to STAGING so actions can be calculated
+      # or commited
+      #
+      def proposal_to_staging
+        storage = StorageManager.instance
+        storage.remove_devicegraph(STAGING) if storage.exist_devicegraph(STAGING)
+        storage.copy_devicegraph(PROPOSAL, STAGING)
+        @actions = storage.calculate_actiongraph
       end
 
       private
+
+      # Prepare the devicegraphs we are working on:
+      #
+      # - PROBED. This contains the disks and partitions that were probed.
+      #
+      # - PROPOSAL_BASE. This starts as a copy of PROBED. If the user decides
+      #        in the UI to have some partitions removed or everything on a
+      #        disk deleted to make room for the Linux installation, those
+      #        partitions are already deleted here. This is the base for all
+      #        calculated proposals. If a proposal goes wrong and needs to be
+      #        reset internally, it will be reset to this state.
+      #
+      #  - PROPOSAL. This is the working devicegraph for the proposal
+      #        calculations. If anything goes wrong, this might be reset (with
+      #        reset_proposal) to PROPOSAL_BASE at any time.
+      #
+      # If no PROPOSAL_BASE devicegraph exists yet, it will be copied from PROBED.
+      #
+      def prepare_devicegraphs
+        storage = StorageManager.instance
+        storage.copy_devicegraph(PROBED, PROPOSAL_BASE) unless storage.exist_devicegraph(PROPOSAL_BASE)
+        reset_proposal
+      end
 
       # Return an array of the standard volumes for the root and /home file
       # systems
@@ -88,8 +146,9 @@ module Yast
       # @return [Array [ProposalVolume]]
       #
       def standard_volumes
-        volumes = [make_root_vol]
-        volumes << make_home_vol if @settings.use_separate_home
+        root_vol = make_root_vol
+        volumes = [root_vol]
+        volumes << make_home_vol(root_vol.desired_size) if @settings.use_separate_home
         volumes
       end
 
@@ -116,11 +175,12 @@ module Yast
       #
       # This does NOT create the partition yet, only the data structure.
       #
-      def make_home_vol
+      def make_home_vol(root_vol_size)
         home_vol = ProposalVolume.new("/home", @settings.home_filesystem_type)
         home_vol.min_size = @settings.home_min_size
         home_vol.max_size = @settings.home_max_size
-        home_vol.desired_size = home_vol.max_size
+        home_percent = 100.0 - @settings.root_space_percent
+        home_vol.desired_size = root_vol_size * (home_percent / @settings.root_space_percent)
         home_vol
       end
     end
